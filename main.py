@@ -14,7 +14,7 @@ from aiogram.types import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8324522332:AAGy6qDs8j-uILme5ReWJXvmUdyUXHBONJY")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8248662151:AAFF5KJbigOsAUB4ZSQSJwjOWELvl_l5if0")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "6555503209")
 ADMIN_IDS: List[int] = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip()]
 
