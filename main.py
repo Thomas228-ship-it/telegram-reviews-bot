@@ -14,15 +14,13 @@ from aiogram.types import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# === ВАШ ТОКЕН И АДМИНЫ (загружаются из переменных окружения) ===
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8324522332:AAGy6qDs8j-uILme5ReWJXvmUdyUXHBONJY")
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "8446467322,6555503209")
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "6555503209")
 ADMIN_IDS: List[int] = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip()]
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# === БАЗА ДАННЫХ ===
 conn = sqlite3.connect("reviews.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
@@ -41,21 +39,11 @@ CREATE TABLE IF NOT EXISTS reviews (
 """)
 conn.commit()
 
-# сессии
-# структура сессии: {
-#   "step": ...,
-#   "rating": ...,
-#   "text": ...,
-#   "attachments": [("photo", fid), ...],
-#   "last_bot_message_id": int|None
-# }
 REVIEW_SESSIONS: Dict[int, Dict] = {}
-PENDING_EDITS: Dict[int, tuple] = {}  # admin_id -> (rid, field)
+PENDING_EDITS: Dict[int, tuple] = {}
 
-# хранит id последнего сообщения бота в каждом чате: chat_id -> message_id
 LAST_BOT_MESSAGE_BY_CHAT: Dict[int, int] = {}
 
-# статус -> эмодзи
 STATUS_EMOJI = {
     "pending": "⏳",
     "approved": "✅",
@@ -121,7 +109,6 @@ def _parse_attachments_from_db(s: Optional[str]) -> List[Tuple[str, str]]:
         res.append((t, fid))
     return res
 
-# ---- Helpers for last message replacement ----
 async def _delete_last_bot_message_in_chat(chat_id: int):
     last_id = LAST_BOT_MESSAGE_BY_CHAT.get(chat_id)
     if not last_id:
@@ -140,8 +127,16 @@ async def _store_last_bot_message(chat_id: int, message_obj: types.Message):
     except Exception:
         logger.exception("Failed to store last bot message for chat %s", chat_id)
 
-# ---- DB helpers ----
 async def add_review_to_db(user_id: int, username: str, rating: int, text_body: str, attachments_list: Optional[List[Tuple[str, str]]] = None) -> int:
+    cursor.execute(
+        "SELECT COUNT(*) FROM reviews WHERE user_id = ?",
+        (user_id,)
+    )
+    count = cursor.fetchone()[0]
+    
+    if count >= 2:
+        raise ValueError("Превышен лимит отзывов (максимум 2 на пользователя)")
+    
     created_at = datetime.utcnow().isoformat(sep=' ', timespec='seconds')
     attachments_str = _attachments_to_str(attachments_list)
     cursor.execute(
@@ -153,7 +148,6 @@ async def add_review_to_db(user_id: int, username: str, rating: int, text_body: 
     await notify_admins_new_review(rid)
     return rid
 
-# ---- helper to send text+attachments with keyboard to admin or user ----
 async def _send_text_with_attachments_and_kb(chat_id: int, text: str, attachments: Optional[List[str]], kb: Optional[InlineKeyboardMarkup] = None):
     """
     attachments: list of strings "type:fileid" (as stored in DB) or None
@@ -164,15 +158,13 @@ async def _send_text_with_attachments_and_kb(chat_id: int, text: str, attachment
     """
     attachments = attachments or []
     try:
-        # удаляем предыдущее сообщение бота в чате, чтобы заменить
         try:
             await _delete_last_bot_message_in_chat(chat_id)
         except Exception:
             pass
 
-        parsed = [tuple(x.split(":", 1)) for x in attachments if ":" in x]  # List[Tuple[type,fid]]
-
-        # Если нет вложений — отправляем просто текст
+        parsed = [tuple(x.split(":", 1)) for x in attachments if ":" in x]
+        
         if not parsed:
             sent_msg = await bot.send_message(chat_id, text, reply_markup=kb)
             await _store_last_bot_message(chat_id, sent_msg)
@@ -181,18 +173,14 @@ async def _send_text_with_attachments_and_kb(chat_id: int, text: str, attachment
         first_type, first_fid = parsed[0]
         sent_msg = None
 
-        # Special: video_note cannot have caption -> send video_note first, then text message
         try:
             if first_type == "video_note":
-                # send the video note first
                 try:
                     await bot.send_video_note(chat_id, first_fid)
                 except Exception:
                     logger.exception("Failed to send video_note %s to %s", first_fid, chat_id)
-                # then send the text card
                 sent_msg = await bot.send_message(chat_id, text, reply_markup=kb)
                 await _store_last_bot_message(chat_id, sent_msg)
-                # send remaining attachments after
             elif first_type == "photo":
                 sent_msg = await bot.send_photo(chat_id, first_fid, caption=text, reply_markup=kb)
                 await _store_last_bot_message(chat_id, sent_msg)
@@ -206,7 +194,6 @@ async def _send_text_with_attachments_and_kb(chat_id: int, text: str, attachment
                 sent_msg = await bot.send_audio(chat_id, first_fid, caption=text, reply_markup=kb)
                 await _store_last_bot_message(chat_id, sent_msg)
             elif first_type == "voice":
-                # voice cannot have caption — send text message first, then voice
                 if text:
                     sent_msg = await bot.send_message(chat_id, text, reply_markup=kb)
                     await _store_last_bot_message(chat_id, sent_msg)
@@ -218,15 +205,12 @@ async def _send_text_with_attachments_and_kb(chat_id: int, text: str, attachment
                     sent_msg = await bot.send_voice(chat_id, first_fid, reply_markup=kb)
                     await _store_last_bot_message(chat_id, sent_msg)
             else:
-                # fallback to text
                 sent_msg = await bot.send_message(chat_id, text, reply_markup=kb)
                 await _store_last_bot_message(chat_id, sent_msg)
         except Exception:
-            # fallback to sending text
             sent_msg = await bot.send_message(chat_id, text, reply_markup=kb)
             await _store_last_bot_message(chat_id, sent_msg)
 
-        # send remaining attachments without captions
         if len(parsed) > 1:
             for t, fid in parsed[1:]:
                 try:
@@ -243,14 +227,12 @@ async def _send_text_with_attachments_and_kb(chat_id: int, text: str, attachment
                     elif t == "video_note":
                         await bot.send_video_note(chat_id, fid)
                     else:
-                        # unknown type -> send as document
                         await bot.send_document(chat_id, fid)
                 except Exception:
                     logger.exception("Failed to send extra attachment %s (%s) to %s", t, fid, chat_id)
     except Exception:
         logger.exception("Error while sending text+attachments to %s", chat_id)
 
-# ---- notify admins (uses helper) ----
 async def notify_admins_new_review(rid: int):
     try:
         cursor.execute("SELECT id, user_id, username, rating, text, attachments, created_at FROM reviews WHERE id = ?", (rid,))
@@ -272,13 +254,7 @@ async def notify_admins_new_review(rid: int):
     except Exception:
         logger.exception("Error in notify_admins_new_review for id=%s", rid)
 
-# ---- Helpers for step-message deletion and step-sending in user flow ----
 async def _send_step_message(uid: int, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
-    """
-    Удаляет предыдущее сообщение бота в чате (глобально по chat_id),
-    отправляет новое и сохраняет его id в глобальный словарь.
-    Также обновляет REVIEW_SESSIONS[uid]['last_bot_message_id'] для совместимости.
-    """
     try:
         await _delete_last_bot_message_in_chat(uid)
     except Exception:
@@ -308,7 +284,6 @@ async def _delete_last_step_message_for_user(uid: int):
     if session:
         session["last_bot_message_id"] = None
 
-# ---- Handlers ----
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer("Привет! Я бот для приёма отзывов. Выбери действие:", reply_markup=main_menu_kb())
@@ -335,7 +310,6 @@ async def cmd_admin_panel(message: Message):
     kb_rows.append([InlineKeyboardButton(text="Закрыть", callback_data="admin_close")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
-    # replace last bot message in this chat
     try:
         await _delete_last_bot_message_in_chat(message.chat.id)
     except Exception:
@@ -357,7 +331,6 @@ async def cb_admin_close(query: CallbackQuery):
 
 @dp.callback_query(F.data == "list_reviews")
 async def cb_list_reviews(query: CallbackQuery):
-    # берем только одобренные отзывы, последние сверху
     cursor.execute("SELECT id, username, rating, text, attachments, created_at FROM reviews WHERE status = 'approved' ORDER BY created_at DESC LIMIT 50")
     rows = cursor.fetchall()
     if not rows:
@@ -368,18 +341,15 @@ async def cb_list_reviews(query: CallbackQuery):
     total = len(rows)
     review_buttons = []
 
-    # нумерация: сверху — total, затем total-1, ..., внизу — 1
     for idx, row in enumerate(rows):
         rid, username, rating, _text, _attachments, created_at = row
         author = username or "Аноним"
-        seq = total - idx  # порядковый номер кнопки
+        seq = total - idx
         btn_text = f"Отзыв {seq} ({rating}⭐ от {author})"
-        # callback по-прежнему содержит реальный review id, чтобы открыть конкретный отзыв
-        review_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"review_{rid}")])
+        review_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"review_{rid}_{seq}")])
 
     review_buttons.append([InlineKeyboardButton(text="Назад", callback_data="main_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=review_buttons)
-    # отправляем/заменяем сообщение
     try:
         await query.message.answer("Выберите отзыв:", reply_markup=kb)
     except Exception:
@@ -424,7 +394,9 @@ async def cb_admin_review_open(query: CallbackQuery):
 @dp.callback_query(F.data.startswith("review_"))
 async def cb_show_review(query: CallbackQuery):
     try:
-        review_id = int(query.data.split("_")[1])
+        parts = query.data.split("_")
+        review_id = int(parts[1])
+        seq_number = int(parts[2]) if len(parts) > 2 else None
     except Exception:
         await query.answer("Некорректный ID", show_alert=True)
         return
@@ -438,9 +410,8 @@ async def cb_show_review(query: CallbackQuery):
     author = username or "Аноним"
     stars = "⭐" * int(rating)
 
-    # формируем текст карточки
-    header = f"Отзыв #{review_id}\n\nОт: {author}\nОценка: {stars}\nДата: {created_at}\n\n"
-    # если текст отсутствует — оставляем пустую строку после header
+    display_number = seq_number if seq_number is not None else review_id
+    header = f"Отзыв #{display_number}\n\nОт: {author}\nОценка: {stars}\nДата: {created_at}\n\n"
     full_text = header + (text_body or "")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -462,6 +433,17 @@ async def cb_main_menu(query: CallbackQuery):
 @dp.callback_query(F.data == "leave_review")
 async def cb_leave_review(query: CallbackQuery):
     uid = query.from_user.id
+    
+    cursor.execute(
+        "SELECT COUNT(*) FROM reviews WHERE user_id = ?",
+        (uid,)
+    )
+    count = cursor.fetchone()[0]
+    
+    if count >= 2:
+        await query.answer("Вы уже оставили максимальное количество отзывов (2).", show_alert=True)
+        return
+    
     REVIEW_SESSIONS[uid] = {"step": "rating", "rating": None, "text": None, "attachments": [], "last_bot_message_id": None}
     await _send_step_message(uid, "Для начала оцените по шкале от 1 до 5 звёзд:", reply_markup=rating_kb())
     try:
@@ -482,11 +464,9 @@ async def cb_rating_selected(query: CallbackQuery):
         return
     REVIEW_SESSIONS[uid]["rating"] = rating
     REVIEW_SESSIONS[uid]["step"] = "text"
-    # <-- изменённый текст тут
     await _send_step_message(uid, "Ваша оценка сохранена!\nТеперь пришлите ваш отзыв (это может быть скрин/видео/кружок):")
     await query.answer()
 
-# Универсальный обработчик сообщений
 def _get_message_text(message: Message) -> Optional[str]:
     return message.text if message.text is not None else getattr(message, "caption", None)
 
@@ -498,12 +478,10 @@ def _gather_attachments_from_message(message: Message) -> List[Tuple[str, str]]:
     res: List[Tuple[str, str]] = []
     try:
         if message.photo:
-            # берем самый большой размер
             res.append(("photo", message.photo[-1].file_id))
         if message.video:
             res.append(("video", message.video.file_id))
         if getattr(message, "video_note", None):
-            # video_note (видеокружок)
             res.append(("video_note", message.video_note.file_id))
         if message.voice:
             res.append(("voice", message.voice.file_id))
@@ -519,7 +497,6 @@ def _gather_attachments_from_message(message: Message) -> List[Tuple[str, str]]:
 async def handle_messages(message: Message):
     uid = message.from_user.id
 
-    # --- Админ: ручное редактирование (если нужно) ---
     if uid in PENDING_EDITS:
         try:
             rid, field = PENDING_EDITS.pop(uid)
@@ -547,7 +524,6 @@ async def handle_messages(message: Message):
             logger.exception("Error while processing admin edit input")
         return
 
-    # --- Пользовательский flow ---
     if uid not in REVIEW_SESSIONS:
         return
 
@@ -555,16 +531,13 @@ async def handle_messages(message: Message):
     step = session.get("step")
 
     raw_text = _get_message_text(message)
-    attachments_here = _gather_attachments_from_message(message)  # List[Tuple[type,fid]]
+    attachments_here = _gather_attachments_from_message(message)
 
-    # --- Step: collecting main text ---
     if step == "text":
-        # if no text and no attachments -> prompt
         if not raw_text and not attachments_here:
             await _send_step_message(uid, "Пожалуйста, отправьте текст отзыва (10–2000 символов) или вложение (фото/видео/документ/голос/кружок).")
             return
 
-        # If text exists -> treat as text body; if attachments exist too, attach them
         if raw_text:
             text_body = raw_text.strip()
             if len(text_body) < 10:
@@ -576,23 +549,23 @@ async def handle_messages(message: Message):
 
             session["text"] = text_body
 
-            # if attachments with text in same message -> accept and save immediately
             if attachments_here:
-                # limit to 3 attachments
                 session["attachments"] = attachments_here[:3]
                 try:
                     rid = await add_review_to_db(uid, message.from_user.username or '', session["rating"], text_body, session["attachments"])
                     await _delete_last_step_message_for_user(uid)
                     await message.answer("Ваш отзыв отправлен на модерацию. Администратор проверит его и опубликует или отклонит.")
+                except ValueError as e:
+                    await _delete_last_step_message_for_user(uid)
+                    await message.answer(str(e))
                 except Exception:
                     logger.exception("Failed to save review with attachments")
                     await message.answer("Произошла ошибка при сохранении отзыва. Попробуйте ещё раз.")
                 REVIEW_SESSIONS.pop(uid, None)
                 return
 
-            # if only text (no attachments) -> ask whether to attach files
             session["attachments"] = []
-            session["step"] = "attachments"  # we will reuse attachments step after user clicks "Да"
+            session["step"] = "attachments"
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Да — прикреплю", callback_data="attach_yes")],
                 [InlineKeyboardButton(text="Нет — отправить", callback_data="confirm_review")],
@@ -601,9 +574,7 @@ async def handle_messages(message: Message):
             await _send_step_message(uid, "Хотите прикрепить скрин/видео/кружок?", reply_markup=kb)
             return
 
-        # raw_text is empty but attachments_here present -> attachments-only flow
         if attachments_here and not raw_text:
-            # Save attachments temporarily and ask whether user wants to add text
             session["attachments"] = attachments_here[:3]
             session["step"] = "maybe_add_text_for_attachments"
             kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -614,7 +585,6 @@ async def handle_messages(message: Message):
             await _send_step_message(uid, "Хотите написать текст для отзыва? (от 10 символов)", reply_markup=kb)
             return
 
-    # --- Step: attachments (user has already provided text and may add attachments) ---
     if step == "attachments":
         if not attachments_here and (not raw_text or raw_text.lower() != "готово"):
             await _send_step_message(uid, "Пришлите до 3 файлов (скрин/видео/кружок) или нажмите 'Готово — подтвердить отправку'.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -623,18 +593,15 @@ async def handle_messages(message: Message):
             ]))
             return
 
-        # if user sends attachments in this step
         if attachments_here:
             current = session.get("attachments", []) or []
             if len(current) + len(attachments_here) > 3:
                 await _send_step_message(uid, "Нельзя прикрепить больше 3 файлов.")
                 return
-            # append only up to limit
             to_add = attachments_here[:(3 - len(current))]
             current.extend(to_add)
             session["attachments"] = current
 
-            # if voice included and user hasn't provided voice caption yet -> move to voice_caption step
             if any(t == "voice" for t, _ in to_add):
                 session["step"] = "voice_caption"
                 kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -650,17 +617,23 @@ async def handle_messages(message: Message):
                 ]))
                 return
 
-        # if user typed "готово" or pressed confirm -> save
         if raw_text and raw_text.lower() == "готово":
-            rid = await add_review_to_db(uid, message.from_user.username or '', session["rating"], session.get("text", ""), session.get("attachments", []))
-            await _delete_last_step_message_for_user(uid)
-            await message.answer("Ваш отзыв отправлен на модерацию. Администратор проверит его и опубликует или отклонит.")
-            REVIEW_SESSIONS.pop(uid, None)
+            try:
+                rid = await add_review_to_db(uid, message.from_user.username or '', session["rating"], session.get("text", ""), session.get("attachments", []))
+                await _delete_last_step_message_for_user(uid)
+                await message.answer("Ваш отзыв отправлен на модерацию. Администратор проверит его и опубликует или отклонит.")
+                REVIEW_SESSIONS.pop(uid, None)
+            except ValueError as e:
+                await _delete_last_step_message_for_user(uid)
+                await message.answer(str(e))
+                REVIEW_SESSIONS.pop(uid, None)
+            except Exception:
+                logger.exception("Failed to save review")
+                await message.answer("Произошла ошибка при сохранении отзыва. Попробуйте ещё раз.")
+                REVIEW_SESSIONS.pop(uid, None)
             return
 
-    # --- Step: maybe_add_text_for_attachments (user sent attachments first and was asked to add text) ---
     if step == "maybe_add_text_for_attachments":
-        # If user sends text now -> validate and save along with attachments
         if raw_text:
             text_body = raw_text.strip()
             if len(text_body) < 10:
@@ -670,19 +643,20 @@ async def handle_messages(message: Message):
                 await _send_step_message(uid, "Текст слишком длинный — максимум 2000 символов.")
                 return
             session["text"] = text_body
-            # save review with text + attachments
             try:
                 rid = await add_review_to_db(uid, message.from_user.username or '', session["rating"], text_body, session.get("attachments", []))
                 await _delete_last_step_message_for_user(uid)
                 await message.answer("Ваш отзыв отправлен на модерацию. Администратор проверит его и опубликует или отклонит.")
+            except ValueError as e:
+                await _delete_last_step_message_for_user(uid)
+                await message.answer(str(e))
             except Exception:
                 logger.exception("Failed to save review with attachments+text")
                 await message.answer("Произошла ошибка при сохранении отзыва. Попробуйте ещё раз.")
             REVIEW_SESSIONS.pop(uid, None)
             return
-        # if no text and user sends more attachments -> allow adding (handled by attachments step)
+
         if attachments_here:
-            # treat as adding attachments (reuse attachments logic)
             current = session.get("attachments", []) or []
             if len(current) + len(attachments_here) > 3:
                 await _send_step_message(uid, "Нельзя прикрепить больше 3 файлов.")
@@ -696,28 +670,28 @@ async def handle_messages(message: Message):
             ]))
             return
 
-    # --- Step: voice_caption (user must send optional caption for voice then we save) ---
     if step == "voice_caption":
-        # If user uses button to skip, they'd trigger callback skip_voice_caption (handled below).
         caption_text = (_get_message_text(message) or "").strip()
         if caption_text and len(caption_text) > 500:
             await _send_step_message(uid, "Слишком длинная подпись к голосу — максимум 500 символов. Отправьте короткую подпись или нажмите 'Пропустить подпись'.")
             return
 
-        # Save review now: use existing session attachments (which must include voice)
-        text_body = caption_text  # optional caption becomes review text
+
+        text_body = caption_text
         attachments = session.get("attachments", [])
         try:
             rid = await add_review_to_db(uid, message.from_user.username or '', session["rating"], text_body, attachments)
             await _delete_last_step_message_for_user(uid)
             await message.answer("Ваш отзыв с голосовым сообщением отправлен на модерацию.")
+        except ValueError as e:
+            await _delete_last_step_message_for_user(uid)
+            await message.answer(str(e))
         except Exception:
             logger.exception("Failed to save voice+caption review")
             await message.answer("Произошла ошибка при сохранении отзыва. Попробуйте ещё раз.")
         REVIEW_SESSIONS.pop(uid, None)
         return
 
-# confirm / cancel callbacks
 @dp.callback_query(F.data == "confirm_review")
 async def cb_confirm_review(query: CallbackQuery):
     uid = query.from_user.id
@@ -738,7 +712,17 @@ async def cb_confirm_review(query: CallbackQuery):
     if not rating:
         await query.answer("Неполные данные. Отзыв не отправлен.", show_alert=True)
         return
-    rid = await add_review_to_db(uid, query.from_user.username or '', rating, text_body, attachments)
+    
+    try:
+        rid = await add_review_to_db(uid, query.from_user.username or '', rating, text_body, attachments)
+    except ValueError as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    except Exception:
+        logger.exception("Failed to save review for user %s", uid)
+        await query.answer("Произошла ошибка при сохранении отзыва.", show_alert=True)
+        return
+    
     try:
         await query.message.answer("Ваш отзыв отправлен на модерацию. Администратор проверит его и опубликует или отклонит.")
     except Exception:
@@ -775,20 +759,21 @@ async def cb_skip_voice_caption(query: CallbackQuery):
             await query.message.answer("Ваш отзыв отправлен на модерацию (без подписи к голосу).")
         except Exception:
             pass
+    except ValueError as e:
+        await query.answer(str(e), show_alert=True)
+        return
     except Exception:
         logger.exception("Failed to save voice-only review (skip caption)")
         await query.answer("Ошибка при сохранении.", show_alert=True)
         return
     await query.answer("Отзыв отправлен")
 
-# дополнительные callback handlers для новых кнопок
 @dp.callback_query(F.data == "attach_yes")
 async def cb_attach_yes(query: CallbackQuery):
     uid = query.from_user.id
     if uid not in REVIEW_SESSIONS:
         await query.answer("Сессия не найдена.", show_alert=True)
         return
-    # переводим пользователя в шаг добавления вложений
     session = REVIEW_SESSIONS[uid]
     session["step"] = "attachments"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -812,7 +797,6 @@ async def cb_write_text(query: CallbackQuery):
     await _send_step_message(uid, "Отправьте текст для отзыва (10–2000 символов).")
     await query.answer()
 
-# admin moderation callbacks
 @dp.callback_query(F.data.startswith("approve_"))
 async def cb_admin_approve(query: CallbackQuery):
     if query.from_user.id not in ADMIN_IDS:
@@ -868,7 +852,6 @@ async def cb_admin_reject(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete_"))
 async def cb_admin_delete(query: CallbackQuery):
-    # Полное удаление отзыва из БД (DELETE) и удаление карточки в админ-чате
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("Только для администраторов.", show_alert=True)
         return
@@ -890,13 +873,11 @@ async def cb_admin_delete(query: CallbackQuery):
         await query.answer("Ошибка при удалении.", show_alert=True)
         return
 
-    # пытаемся удалить карточку- сообщение в админ-чате, откуда пришёл callback
     try:
         await query.message.delete()
     except Exception:
         logger.debug("Не удалось удалить admin message for review %s", rid)
 
-    # пробуем удалить последнее сообщение бота в том же чате (если есть)
     try:
         await _delete_last_bot_message_in_chat(query.message.chat.id)
     except Exception:
@@ -913,7 +894,7 @@ async def cb_admin_delete(query: CallbackQuery):
     except Exception:
         pass
 
-@dp.callback_query(F.data.startswith("edit_"))
+@dp.callback_query(F.data.startswith("edit_") & ~F.data.startswith("edit_field_"))
 async def cb_admin_edit(query: CallbackQuery):
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("Только для администраторов.", show_alert=True)
@@ -943,7 +924,6 @@ async def cb_admin_edit_field(query: CallbackQuery):
         await query.message.answer("Отправьте новый рейтинг (число 1–5).")
     await query.answer()
 
-# ---- запуск ----
 async def main():
     logger.info("Starting bot...")
     try:
@@ -954,5 +934,8 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
+
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped")
